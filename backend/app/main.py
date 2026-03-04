@@ -18,6 +18,7 @@ Coordinate System & Resolution Notes
 
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -25,6 +26,7 @@ import fitz  # PyMuPDF
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -122,3 +124,45 @@ async def get_pdf(job_id: str):
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="PDF not found.")
     return FileResponse(pdf_path, media_type="application/pdf")
+
+
+# ---------------------------------------------------------------------------
+# Room / polygon results
+# ---------------------------------------------------------------------------
+
+
+class RoomPayload(BaseModel):
+    """A single room polygon with its label and vertices in pixel space."""
+    label: str
+    vertices: list[list[float]]  # [[x, y], ...]
+    wall_height: float | None = None  # optional, metres
+
+
+class PageResults(BaseModel):
+    """All rooms on a single page."""
+    rooms: list[RoomPayload]
+    scale_factor: float | None = None  # pixels-per-metre if known
+
+
+def _results_path(job_id: str, page: int) -> Path:
+    return UPLOAD_DIR / job_id / f"results_{page}.json"
+
+
+@app.get("/api/results/{job_id}/{page}")
+async def get_results(job_id: str, page: int):
+    """Return saved room polygons for a page (or empty list)."""
+    path = _results_path(job_id, page)
+    if not path.exists():
+        return {"rooms": [], "scale_factor": None}
+    return json.loads(path.read_text())
+
+
+@app.put("/api/results/{job_id}/{page}")
+async def put_results(job_id: str, page: int, body: PageResults):
+    """Create or update room polygons for a page."""
+    job_dir = UPLOAD_DIR / job_id
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Job not found.")
+    path = _results_path(job_id, page)
+    path.write_text(body.model_dump_json(indent=2))
+    return {"ok": True}
