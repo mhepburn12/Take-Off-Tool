@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
-import type { JobResult } from "../App";
+import type { JobResult } from "../types";
 import { usePageResults } from "../hooks/usePageResults";
 import RoomOverlay from "./RoomOverlay";
 import RoomSidebar from "./RoomSidebar";
@@ -12,11 +12,6 @@ import RoomSidebar from "./RoomSidebar";
  * The <img> element uses its natural (pixel) dimensions so that every pixel in
  * the 300-DPI PNG maps 1:1 to screen pixels at zoom = 1×.  The SVG overlay
  * sits in the same coordinate space and transforms identically.
- *
- * Pixel ↔ PDF-point conversion:
- *   const SCALE = dpi / 72;          // 300/72 ≈ 4.1667
- *   pdfPt  = pixel / SCALE;
- *   pixel  = pdfPt * SCALE;
  */
 
 interface Props {
@@ -33,8 +28,10 @@ export default function Viewer({ job, onReset }: Props) {
 
   const imageUrl = job.pages[page]?.url ?? "";
 
-  // Get room-detection results for the current page.
-  const pageResults = usePageResults(job.job_id, page, imgSize.w, imgSize.h);
+  const { results: pageResults, loading, error, extract } = usePageResults(
+    job.job_id,
+    page,
+  );
 
   const handleImgLoad = useCallback(() => {
     const img = imgRef.current;
@@ -72,6 +69,21 @@ export default function Viewer({ job, onReset }: Props) {
           Next
         </button>
 
+        <button
+          onClick={extract}
+          disabled={loading}
+          style={{
+            ...styles.extractBtn,
+            opacity: loading ? 0.6 : 1,
+          }}
+        >
+          {loading ? "Extracting..." : "Extract Rooms"}
+        </button>
+
+        {error && (
+          <span style={styles.errorText}>{error}</span>
+        )}
+
         <span style={styles.meta}>
           Job: {job.job_id.slice(0, 8)}&hellip; | {job.dpi} DPI
         </span>
@@ -86,22 +98,13 @@ export default function Viewer({ job, onReset }: Props) {
             minScale={0.1}
             maxScale={5}
             centerOnInit
-            key={page} // reset zoom/pan when page changes
+            key={page}
           >
             <TransformComponent
               wrapperStyle={{ width: "100%", height: "100%" }}
               contentStyle={{ width: "fit-content", height: "fit-content" }}
             >
-              {/*
-                Wrapper div with position:relative so the SVG overlay can sit
-                exactly on top of the image in the same pixel space.
-              */}
               <div style={{ position: "relative" }}>
-                {/*
-                  The image renders at its natural resolution (300 DPI PNG).
-                  Do NOT apply width/height overrides — we need 1:1 pixel
-                  mapping so overlay coordinates stay correct.
-                */}
                 <img
                   ref={imgRef}
                   src={imageUrl}
@@ -111,7 +114,6 @@ export default function Viewer({ job, onReset }: Props) {
                   style={{ display: "block" }}
                 />
 
-                {/* SVG room overlay — same pixel space as the image */}
                 {pageResults && (
                   <RoomOverlay
                     results={pageResults}
@@ -124,6 +126,16 @@ export default function Viewer({ job, onReset }: Props) {
               </div>
             </TransformComponent>
           </TransformWrapper>
+
+          {loading && (
+            <div style={styles.loadingOverlay}>
+              <div style={styles.loadingBox}>
+                <div style={styles.spinner} />
+                <p>Extracting rooms with AI...</p>
+                <p style={styles.loadingHint}>This may take 15-30 seconds</p>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Sidebar — room list, controls, totals */}
@@ -156,6 +168,7 @@ const styles: Record<string, React.CSSProperties> = {
     background: "#fff",
     borderBottom: "1px solid #ddd",
     flexShrink: 0,
+    flexWrap: "wrap",
   },
   pageInfo: { fontWeight: 600 },
   meta: { marginLeft: "auto", fontSize: 12, color: "#888" },
@@ -168,5 +181,54 @@ const styles: Record<string, React.CSSProperties> = {
     flex: 1,
     overflow: "hidden",
     background: "#e0e0e0",
+    position: "relative",
+  },
+  extractBtn: {
+    background: "#4f46e5",
+    color: "#fff",
+    border: "none",
+    borderRadius: 6,
+    padding: "6px 14px",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  errorText: {
+    fontSize: 12,
+    color: "#dc2626",
+    maxWidth: 300,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  loadingOverlay: {
+    position: "absolute",
+    inset: 0,
+    background: "rgba(0,0,0,0.5)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 10,
+  },
+  loadingBox: {
+    background: "#fff",
+    borderRadius: 12,
+    padding: "32px 48px",
+    textAlign: "center",
+    boxShadow: "0 8px 32px rgba(0,0,0,0.2)",
+  },
+  spinner: {
+    width: 40,
+    height: 40,
+    border: "4px solid #e5e7eb",
+    borderTopColor: "#4f46e5",
+    borderRadius: "50%",
+    margin: "0 auto 16px",
+    animation: "spin 0.8s linear infinite",
+  },
+  loadingHint: {
+    fontSize: 13,
+    color: "#888",
+    marginTop: 4,
   },
 };

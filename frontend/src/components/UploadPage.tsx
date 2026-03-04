@@ -3,11 +3,9 @@ import type { JobResult } from "../types";
 
 interface Props {
   onUploaded: (job: JobResult) => void;
-  onAddToast: (type: "success" | "error" | "warning" | "info", message: string) => void;
 }
 
-/** Upload page for selecting and uploading a PDF plan. */
-export default function UploadPage({ onUploaded, onAddToast }: Props) {
+export default function UploadPage({ onUploaded }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -37,7 +35,6 @@ export default function UploadPage({ onUploaded, onAddToast }: Props) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Upload failed";
       setError(msg);
-      onAddToast("error", msg);
     } finally {
       setUploading(false);
       setProgress("");

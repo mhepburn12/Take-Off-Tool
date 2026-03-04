@@ -20,15 +20,23 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import uuid
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import anthropic
 import fitz  # PyMuPDF
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+
+logger = logging.getLogger("plan-takeoff")
+logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -39,6 +47,9 @@ DPI = 300
 
 DEFAULT_CEILING_HEIGHT_MM = 2400
 """Default floor-to-ceiling height in millimetres, used for wall area calc."""
+
+CLAUDE_MAX_IMAGE_PX = 7680
+"""Max dimension (width or height) before downscaling for Claude's 8000px limit."""
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -117,6 +128,37 @@ def _segment_length_px(p1: list[float], p2: list[float]) -> float:
     return math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
 
 
+def _downscale_png_for_claude(image_path: Path) -> bytes:
+    """Return PNG bytes, downscaled if either dimension exceeds CLAUDE_MAX_IMAGE_PX.
+
+    Uses PyMuPDF Pixmap for accurate pixel dimensions (page.rect gives points,
+    not pixels). The full-resolution file on disk is left untouched.
+    """
+    src = fitz.Pixmap(str(image_path))
+    w, h = src.width, src.height
+
+    if w <= CLAUDE_MAX_IMAGE_PX and h <= CLAUDE_MAX_IMAGE_PX:
+        src = None
+        return image_path.read_bytes()
+
+    scale = min(CLAUDE_MAX_IMAGE_PX / w, CLAUDE_MAX_IMAGE_PX / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    doc = fitz.open(str(image_path))
+    page = doc[0]
+    mat = fitz.Matrix(new_w / page.rect.width, new_h / page.rect.height)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    logger.info(
+        "Downscaled %dx%d -> %dx%d (%.1f%%) for Claude API",
+        w, h, pix.width, pix.height, scale * 100,
+    )
+    png_bytes = pix.tobytes("png")
+    doc.close()
+    src = None
+    return png_bytes
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -132,22 +174,19 @@ async def upload_pdf(file: UploadFile):
     job_dir = UPLOAD_DIR / job_id
     job_dir.mkdir(parents=True)
 
-    # Persist the original PDF
     pdf_path = job_dir / "original.pdf"
     contents = await file.read()
     pdf_path.write_bytes(contents)
 
-    # Convert to PNGs
     page_count = _convert_pdf(pdf_path, job_dir)
 
-    # Initialise job metadata
     job_meta = {
         "job_id": job_id,
         "page_count": page_count,
         "dpi": DPI,
         "ceiling_height_mm": DEFAULT_CEILING_HEIGHT_MM,
-        "calibrations": {},  # keyed by page number (string)
-        "results": {},       # keyed by page number (string)
+        "calibrations": {},
+        "results": {},
     }
     _save_job(job_id, job_meta)
 
@@ -195,13 +234,6 @@ async def calibrate_page(job_id: str, page: int, body: dict):
             "pixel_length": 542.0,
             "real_length_mm": 3000.0
         }
-
-    *pixel_length* is the distance in image-pixel units between two points the
-    user drew on the plan.  *real_length_mm* is the real-world distance those
-    two points represent, in millimetres.
-
-    The derived **scale** (mm-per-pixel) is stored so that downstream
-    extraction can convert pixel measurements to real-world units.
     """
     job_dir = UPLOAD_DIR / job_id
     if not job_dir.exists():
@@ -278,7 +310,7 @@ trailing commas. Use this exact schema:
 async def extract_measurements(job_id: str, page: int):
     """Send page image to Claude for room extraction, compute measurements.
 
-    Requires calibration to have been set for this page first.
+    Uses calibration if available; otherwise computes pixel-based areas only.
     """
     job_dir = UPLOAD_DIR / job_id
     if not job_dir.exists():
@@ -293,22 +325,28 @@ async def extract_measurements(job_id: str, page: int):
         raise HTTPException(status_code=404, detail="Job metadata not found.")
 
     calibration = job_meta.get("calibrations", {}).get(str(page))
-    if not calibration:
-        raise HTTPException(
-            status_code=400,
-            detail="Page has not been calibrated. Set calibration first.",
-        )
-
-    mm_per_pixel = calibration["mm_per_pixel"]
+    mm_per_pixel = calibration["mm_per_pixel"] if calibration else None
     ceiling_height_mm = job_meta.get("ceiling_height_mm", DEFAULT_CEILING_HEIGHT_MM)
 
     # ------------------------------------------------------------------
-    # 1. Send image to Claude
+    # 1. Send image to Claude (downscaled if necessary)
     # ------------------------------------------------------------------
-    image_bytes = img_path.read_bytes()
-    image_b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+    png_bytes = _downscale_png_for_claude(img_path)
 
-    client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
+    # If downscaled, compute the scale factor so we can map Claude's
+    # pixel coordinates back to the original image dimensions.
+    src_pix = fitz.Pixmap(str(img_path))
+    orig_w, orig_h = src_pix.width, src_pix.height
+    src_pix = None
+
+    sent_pix = fitz.Pixmap(png_bytes)
+    sent_w = sent_pix.width
+    src_pix = None
+    coord_scale = orig_w / sent_w if sent_w != orig_w else 1.0
+
+    image_b64 = base64.standard_b64encode(png_bytes).decode("ascii")
+
+    client = anthropic.Anthropic()
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=4096,
@@ -337,9 +375,8 @@ async def extract_measurements(job_id: str, page: int):
     # 2. Parse the JSON response
     # ------------------------------------------------------------------
     raw_text = message.content[0].text.strip()
-    # Strip markdown fences if model included them despite instructions
     if raw_text.startswith("```"):
-        raw_text = raw_text.split("\n", 1)[1]  # remove opening fence line
+        raw_text = raw_text.split("\n", 1)[1]
         if raw_text.endswith("```"):
             raw_text = raw_text[: -len("```")].rstrip()
 
@@ -359,24 +396,30 @@ async def extract_measurements(job_id: str, page: int):
     rooms_out: list[dict] = []
     for room in rooms_raw:
         label = room.get("label", "Unknown")
-        vertices = room.get("vertices", [])
+        vertices_raw = room.get("vertices", [])
         edges = room.get("edges", [])
 
-        # Floor area via shoelace
-        area_px2 = _shoelace_area(vertices)
-        area_mm2 = area_px2 * (mm_per_pixel ** 2)
-        area_m2 = area_mm2 / 1_000_000.0
+        # Scale coordinates back to original image pixel space
+        vertices = [
+            [v[0] * coord_scale, v[1] * coord_scale] for v in vertices_raw
+        ]
 
-        # Wall segments
+        area_px2 = _shoelace_area(vertices)
+
+        if mm_per_pixel:
+            area_mm2 = area_px2 * (mm_per_pixel ** 2)
+            area_m2 = area_mm2 / 1_000_000.0
+        else:
+            area_m2 = 0.0
+
         n = len(vertices)
         walls: list[dict] = []
         for i in range(n):
             p1 = vertices[i]
             p2 = vertices[(i + 1) % n]
             length_px = _segment_length_px(p1, p2)
-            length_mm = length_px * mm_per_pixel
-            wall_area_mm2 = length_mm * ceiling_height_mm
-            wall_area_m2 = wall_area_mm2 / 1_000_000.0
+            length_mm = length_px * mm_per_pixel if mm_per_pixel else 0.0
+            wall_area_m2 = (length_mm * ceiling_height_mm) / 1_000_000.0
             edge_type = edges[i] if i < len(edges) else "interior_wall"
             walls.append({
                 "from": p1,
@@ -388,8 +431,8 @@ async def extract_measurements(job_id: str, page: int):
 
         rooms_out.append({
             "label": label,
-            "vertices": vertices,       # pass-through from Claude exactly
-            "edges": edges,             # pass-through from Claude exactly
+            "vertices": vertices,
+            "edges": edges,
             "floor_area_m2": round(area_m2, 2),
             "walls": walls,
             "ceiling_height_mm": ceiling_height_mm,
