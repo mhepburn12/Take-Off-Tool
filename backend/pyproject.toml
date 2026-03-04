@@ -1,13 +1,15 @@
 [project]
 name = "plan-takeoff-backend"
 version = "0.1.0"
-description = "Add your description here"
+description = "Backend for Plan Take-Off Tool — PDF upload, conversion, AI extraction, and polygon validation."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic>=0.42.0",
     "fastapi>=0.135.1",
     "pymupdf>=1.27.1",
     "python-multipart>=0.0.22",
+    "shapely>=2.0.0",
     "uvicorn>=0.41.0",
 ]
 

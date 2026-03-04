@@ -5,3 +5,10 @@
   flex-direction: column;
   overflow: hidden;
 }
+
+/* Responsive: on narrow screens, let the viewer stack vertically */
+@media (max-width: 768px) {
+  .app {
+    font-size: 14px;
+  }
+}

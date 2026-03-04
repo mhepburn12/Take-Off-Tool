@@ -33,3 +33,22 @@ button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* Spinner animation used by loading overlays and progress indicators */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Slide-in animation for toasts */
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(40px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
